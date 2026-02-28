@@ -8,7 +8,7 @@ export class AudioModem {
         this.mediaRecorder = null;
         this.streamDest = null;
         
-        // Frequencies for FSK
+        // Default Frequencies for FSK (Bell 202 standard)
         this.markFreq = 2200; // 1
         this.spaceFreq = 1200; // 0
         
@@ -114,17 +114,37 @@ export class AudioModem {
         }
     }
 
+    getFrequencies(baud) {
+        // Dynamic frequency scaling for higher speeds
+        if (baud > 2000) {
+            // High speed mode: Push frequencies higher to get more cycles per bit
+            // Max typical hearing/mic is ~16kHz.
+            // 6000 baud needs space for sidebands. 
+            // Space=6kHz, Mark=10kHz
+            return { space: 6000, mark: 10000 };
+        } else {
+            // Standard Bell 202
+            return { space: 1200, mark: 2200 };
+        }
+    }
+
     async transmit(file, baudRate, onProgress, onComplete) {
         await this.init();
         this.baud = baudRate;
         
+        const freqs = this.getFrequencies(baudRate);
+        this.spaceFreq = freqs.space;
+        this.markFreq = freqs.mark;
+
         const bitStream = await this.prepareFile(file);
         
         this.node.port.postMessage({
             type: 'TX_START',
             buffer: bitStream,
             baud: this.baud,
-            sampleRate: this.ctx.sampleRate
+            sampleRate: this.ctx.sampleRate,
+            freqLow: this.spaceFreq,
+            freqHigh: this.markFreq
         });
         
         this.node.port.onmessage = (e) => {
@@ -138,6 +158,11 @@ export class AudioModem {
     
     async generateDownloadLink(file, baudRate, onProgress) {
         const sampleRate = 44100;
+        
+        const freqs = this.getFrequencies(baudRate);
+        const spaceF = freqs.space;
+        const markF = freqs.mark;
+        
         const bitStream = await this.prepareFile(file);
         const samplesPerSymbol = sampleRate / baudRate;
         const totalSamples = Math.floor(bitStream.length * samplesPerSymbol);
@@ -193,7 +218,7 @@ export class AudioModem {
             
             for (let b = i; b < end; b++) {
                 const bit = bitStream[b];
-                const freq = bit === 1 ? this.markFreq : this.spaceFreq;
+                const freq = bit === 1 ? markF : spaceF;
                 
                 const bitStartSample = Math.floor(b * samplesPerSymbol);
                 const bitEndSample = Math.floor((b + 1) * samplesPerSymbol);
@@ -384,21 +409,21 @@ export class AudioModem {
         const sampleRate = audioBuffer.sampleRate;
         const samplesPerBit = sampleRate / this.baud;
         
+        // Update frequencies based on current baud setting for decoding
+        const freqs = this.getFrequencies(this.baud);
+        const decodeSpace = freqs.space;
+        const decodeMark = freqs.mark;
+
         // Helper: Quadrature detection for magnitude
-        // Using Goertzel-like correlation over a bit period to ensure phase independence
         const getMagnitude = (startIdx, length, freq) => {
             let sumI = 0;
             let sumQ = 0;
             const w = 2 * Math.PI * freq / sampleRate;
+            const safeLength = Math.floor(length); // Use full length for max energy
             
-            // Optimization: Iterate slightly fewer than full bit width to avoid edge ISI
-            const safeLength = Math.floor(length * 0.8);
-            const offset = Math.floor((length - safeLength) / 2);
-            const effectiveStart = startIdx + offset;
-
             for (let i = 0; i < safeLength; i++) {
-                if (effectiveStart + i >= data.length) break;
-                const sample = data[effectiveStart + i];
+                if (startIdx + i >= data.length) break;
+                const sample = data[startIdx + i];
                 const angle = w * i; 
                 sumI += sample * Math.cos(angle);
                 sumQ += sample * Math.sin(angle);
@@ -406,86 +431,123 @@ export class AudioModem {
             return Math.sqrt(sumI * sumI + sumQ * sumQ);
         };
 
-        // 1. Scan for signal (Start Bit = 0 = Space = 1200Hz)
-        let ptr = 0;
         const window = Math.floor(samplesPerBit);
-        const step = Math.floor(window / 4);
+        const step = Math.max(1, Math.floor(window / 8)); // Finer step for sync
+        
+        // 1. Initial Scan for Carrier/Leader
+        // We look for a sequence of '1's (Mark) which is the idle state, 
+        // followed by a '0' (Space) which is the Start Bit.
+        let ptr = 0;
         let syncFound = false;
         
-        // Find first strong Space (1200Hz) indicating Start Bit
-        // Must be significantly stronger than Mark and Noise
-        while (ptr < data.length - window) {
-            const magSpace = getMagnitude(ptr, window, this.spaceFreq);
-            const magMark = getMagnitude(ptr, window, this.markFreq);
+        while (ptr < data.length - window * 2) {
+            const mSpace = getMagnitude(ptr, window, decodeSpace);
+            const mMark = getMagnitude(ptr, window, decodeMark);
             
-            // Thresholds:
-            // 1. Space energy must be above noise floor (> 0.05)
-            // 2. Space energy must be dominant (> 2.0x Mark energy to avoid false triggers in noise)
-            if (magSpace > 0.05 && magSpace > magMark * 2.0) {
+            // Check for Start Bit (Space)
+            // Relaxed threshold: Space > Mark * 1.2
+            if (mSpace > 0.01 && mSpace > mMark * 1.2) {
                 syncFound = true;
                 break;
             }
             ptr += step;
         }
 
-        if (!syncFound) return;
+        if (!syncFound) return; // No signal found
 
-        // ptr is now roughly at the start of the first Start Bit.
-        // Center of Start Bit ~= ptr + window/2
+        // We found a start bit candidate at 'ptr'.
+        // Refine 'ptr' to find the edge (transition from Mark to Space)
+        // Backtrack slightly and find where Space energy crosses Mark energy
+        let refinedPtr = Math.max(0, ptr - window);
+        const refineEnd = ptr + window;
+        while(refinedPtr < refineEnd) {
+             const mSpace = getMagnitude(refinedPtr, window, decodeSpace);
+             const mMark = getMagnitude(refinedPtr, window, decodeMark);
+             if (mSpace > mMark) {
+                 ptr = refinedPtr;
+                 break;
+             }
+             refinedPtr += Math.max(1, Math.floor(step/2));
+        }
+
+        // Point to center of first Start Bit
         let samplePtr = ptr + Math.floor(window / 2);
 
         // 2. Decode Loop
+        let consecutiveErrors = 0;
+        
         while (samplePtr < data.length) {
-            // Read 10 bits: Start, D0..D7, Stop
-            let rawBits = [];
+            // We expect 10 bits: Start(0), D0..D7, Stop(1)
             
-            for (let b = 0; b < 10; b++) {
-                const bitCenter = samplePtr + Math.floor(b * samplesPerBit);
-                const readStart = bitCenter - Math.floor(window / 2);
+            // Read all 10 bits
+            const bits = [];
+            const bitMagnitudes = [];
+            
+            for(let i=0; i<10; i++) {
+                const center = samplePtr + Math.floor(i * samplesPerBit);
+                // Center the window
+                const start = center - Math.floor(window/2);
                 
-                if (readStart + window >= data.length) break;
-
-                const mSpace = getMagnitude(readStart, window, this.spaceFreq);
-                const mMark = getMagnitude(readStart, window, this.markFreq);
+                const mSpace = getMagnitude(start, window, decodeSpace);
+                const mMark = getMagnitude(start, window, decodeMark);
                 
-                rawBits.push(mMark > mSpace ? 1 : 0);
+                bits.push(mMark > mSpace ? 1 : 0);
+                bitMagnitudes.push({space: mSpace, mark: mMark});
             }
             
-            if (rawBits.length < 10) break;
-
-            // Check Framing: Start=0, Stop=1
-            if (rawBits[0] === 0 && rawBits[9] === 1) {
+            // Validate Framing
+            // Valid: Start=0, Stop=1
+            if (bits[0] === 0 && bits[9] === 1) {
+                // Good Frame
                 let byte = 0;
                 for (let i = 0; i < 8; i++) {
-                    if (rawBits[i+1] === 1) byte |= (1 << i);
+                    if (bits[i+1] === 1) byte |= (1 << i);
                 }
                 onByte(byte);
+                consecutiveErrors = 0;
                 
-                // Advance to next Start Bit (10 bits total)
+                // Hard Sync Adjustment
+                // Recalculate center based on Stop bit edge if possible, 
+                // but for now, just advance by exactly 10 bits.
                 samplePtr += Math.floor(10 * samplesPerBit);
-            } else {
-                // Framing Error - Drift or Noise
-                // Try to resync by sliding forward to find next Start Bit (Space)
-                let foundNext = false;
-                const searchLimit = samplePtr + Math.floor(2 * samplesPerBit);
-                let searchPtr = samplePtr + step; 
                 
-                while (searchPtr < searchLimit && searchPtr < data.length - window) {
-                     const readStart = searchPtr - Math.floor(window / 2);
-                     const mSpace = getMagnitude(readStart, window, this.spaceFreq);
-                     const mMark = getMagnitude(readStart, window, this.markFreq);
-                     
-                     if (mSpace > mMark * 1.5) {
-                         samplePtr = searchPtr;
-                         foundNext = true;
-                         break;
-                     }
-                     searchPtr += step;
+            } else {
+                // Framing Error
+                consecutiveErrors++;
+                if (consecutiveErrors > 50) {
+                     // Lost sync completely, scan for next start bit
+                     samplePtr += Math.floor(samplesPerBit); // Nudge forward
+                     // We fall through to the resync logic below
                 }
                 
-                if (!foundNext) {
-                    // Just skip forward 1 bit and hope
-                    samplePtr += Math.floor(samplesPerBit);
+                // Resync Logic: Look for the next Start Bit (Space)
+                // We expected a Start bit at samplePtr, but didn't get 0, or didn't get Stop 1.
+                // Let's scan forward bit by bit to find a 0 followed by valid data
+                let reSyncFound = false;
+                // Scan range: next 20 bits
+                const scanLimit = samplePtr + Math.floor(20 * samplesPerBit);
+                let scanPtr = samplePtr + Math.floor(samplesPerBit * 0.5); // Move past current bad position
+                
+                while(scanPtr < scanLimit && scanPtr < data.length - window) {
+                     const start = scanPtr - Math.floor(window/2);
+                     const mSpace = getMagnitude(start, window, decodeSpace);
+                     const mMark = getMagnitude(start, window, decodeMark);
+                     
+                     // Found a potential Start Bit
+                     if (mSpace > mMark * 1.2) {
+                         // Check if Stop bit exists 9 bits later?
+                         // Ideally yes, but computationally expensive. 
+                         // Just assume this is the new start.
+                         samplePtr = scanPtr;
+                         reSyncFound = true;
+                         break;
+                     }
+                     scanPtr += Math.floor(samplesPerBit / 4); // Quarter bit steps
+                }
+                
+                if (!reSyncFound) {
+                    // No start bit found nearby, just skip this frame length
+                    samplePtr += Math.floor(10 * samplesPerBit);
                 }
             }
         }

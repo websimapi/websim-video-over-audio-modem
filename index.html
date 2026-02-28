@@ -146,6 +146,11 @@
                         this.baud = e.data.baud;
                         this.sampleRate = e.data.sampleRate;
                         this.samplesPerSymbol = this.sampleRate / this.baud;
+
+                        // Allow dynamic frequencies
+                        if (e.data.freqLow) this.freqLow = e.data.freqLow;
+                        if (e.data.freqHigh) this.freqHigh = e.data.freqHigh;
+
                         this.txIndex = 0;
                         this.txActive = true;
                         this.phase = 0;

@@ -316,14 +316,15 @@ audioInput.addEventListener('change', async (e) => {
                     rxStatus.textContent = "Decoding Successful!";
                 } else {
                     console.warn("Decoding finished incomplete.");
-                    rxStatus.textContent = "Decoding Finished (Incomplete).";
                     // Try to render what we have if we at least got a header
                     if (rxHeader && rxBuffer.length > 0) {
+                         rxStatus.textContent = "Stream ended. Attempting partial render...";
                         finishDecoding();
                     } else if (rxBuffer.length > 0) {
-                        rxStatus.textContent = "Failed: Header not found. Check Baud Rate.";
+                        rxStatus.textContent = "Failed: Header not found or signal too noisy.";
+                        console.log("Buffered bytes:", rxBuffer.slice(0, 20).map(b=>b.toString(16)));
                     } else {
-                        rxStatus.textContent = "Failed: No signal detected.";
+                        rxStatus.textContent = "Failed: No signal detected. Check Baud Rate.";
                     }
                 }
             });
@@ -461,13 +462,16 @@ function finishDecoding() {
 
         const url = URL.createObjectURL(blob);
         
-        outputVideo.onerror = () => {
-            rxStatus.textContent = "Video format not supported or corrupted.";
-            console.error("Video load error");
+        // Reset video element to clear previous errors
+        outputVideo.removeAttribute('src');
+        outputVideo.load();
+
+        outputVideo.onerror = (e) => {
+            rxStatus.textContent = "Video corrupted or format unsupported.";
+            console.error("Video load error", e);
         };
         
         outputVideo.src = url;
-        outputVideo.load();
         
         downloadVideo.href = url;
         
