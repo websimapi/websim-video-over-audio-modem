@@ -308,7 +308,11 @@ audioInput.addEventListener('change', async (e) => {
             if (rxMode === 'DONE') {
                 rxStatus.textContent = "Decoding Successful!";
             } else {
-                rxStatus.textContent = "Decoding Finished (Checksum/Truncated?)";
+                console.warn("Decoding finished incomplete. Attempting to render partial data.");
+                rxStatus.textContent = "Decoding Finished (Partial).";
+                if (rxHeader && rxBuffer.length > 0) {
+                    finishDecoding();
+                }
             }
         });
 });
@@ -378,6 +382,14 @@ function processByte(byte) {
             const size = new Uint32Array(sizeBytes.buffer)[0];
             const mimeLen = rxBuffer[4];
             
+            // Sanity Check for invalid headers (noise)
+            if (size > 100000000 || mimeLen > 100 || size === 0) { 
+                console.warn(`Invalid Header detected: Size=${size}`);
+                rxMode = 'SEARCHING';
+                rxBuffer = [];
+                return;
+            }
+
             rxHeader = { size, mimeLen, mime: '' };
         } 
         
@@ -407,14 +419,33 @@ function processByte(byte) {
 function finishDecoding() {
     rxStatus.textContent = "Reconstructing Video...";
     
-    const byteArray = new Uint8Array(rxBuffer);
-    const blob = new Blob([byteArray], { type: rxHeader.mime });
-    const url = URL.createObjectURL(blob);
-    
-    outputVideo.src = url;
-    downloadVideo.href = url;
-    downloadVideo.download = `decoded_video.${rxHeader.mime.split('/')[1]}`;
-    
-    resultArea.classList.remove('hidden');
-    rxStatus.textContent = "Complete!";
+    if (rxBuffer.length === 0) {
+        rxStatus.textContent = "Error: No data decoded.";
+        return;
+    }
+
+    try {
+        const byteArray = new Uint8Array(rxBuffer);
+        const mime = (rxHeader && rxHeader.mime) ? rxHeader.mime : 'video/mp4';
+        const blob = new Blob([byteArray], { type: mime });
+        
+        if (blob.size === 0) throw new Error("Empty Blob");
+
+        const url = URL.createObjectURL(blob);
+        
+        outputVideo.src = url;
+        downloadVideo.href = url;
+        
+        let ext = 'mp4';
+        if (mime.includes('webm')) ext = 'webm';
+        else if (mime.includes('quicktime')) ext = 'mov';
+        
+        downloadVideo.download = `decoded_video.${ext}`;
+        
+        resultArea.classList.remove('hidden');
+        rxStatus.textContent = "Complete!";
+    } catch (e) {
+        console.error("Reconstruction failed:", e);
+        rxStatus.textContent = "Error reconstructing video file.";
+    }
 }

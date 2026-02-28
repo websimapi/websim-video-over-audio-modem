@@ -368,71 +368,111 @@ export class AudioModem {
         // ... (Decoder logic omitted for brevity in thought process, implementing robust buffer processor below)
     }
     
-    // Better Decoder: Process Audio Buffer Offline (Used for File Upload and accumulated Mic recording)
+    // Better Decoder: Process Audio Buffer Offline (Used for File Upload)
     async decodeOffline(audioBuffer, onByte) {
         const data = audioBuffer.getChannelData(0);
         const sampleRate = audioBuffer.sampleRate;
-        const samplesPerBit = sampleRate / this.baud; // Need to know baud or detect it
+        const samplesPerBit = sampleRate / this.baud;
         
-        // Goertzel or Sliding DFT
-        // Let's do a simple zero-crossing or sliding correlation if frequencies are far apart.
-        // FSK: 1200 vs 2200.
-        
-        let phase = 0;
-        let byteAssembler = 0;
-        let bitCount = 0;
-        let state = 'SEARCH_SYNC'; // SEARCH_SYNC, READ_BITS
-        
-        // This is complex. Let's simplify: 
-        // We just look for the magic header sequence 0xAA 0x55 in the stream of bits.
-        
-        // 1. Convert audio samples to Bit Stream
-        const bits = [];
-        const windowSize = Math.floor(samplesPerBit);
-        
-        // Running average energy detector
-        for (let i = 0; i < data.length; i += windowSize) {
-            // Analyze window
-            let e1200 = 0;
-            let e2200 = 0;
+        // Helper: Quadrature detection for magnitude
+        // Using Goertzel-like correlation over a bit period to ensure phase independence
+        const getMagnitude = (startIdx, length, freq) => {
+            let sumI = 0;
+            let sumQ = 0;
+            const w = 2 * Math.PI * freq / sampleRate;
             
-            for (let j = 0; j < windowSize && (i+j) < data.length; j++) {
-                const s = data[i+j];
-                // Simple correlation
-                e1200 += s * Math.sin(2 * Math.PI * 1200 * (i+j) / sampleRate);
-                e2200 += s * Math.sin(2 * Math.PI * 2200 * (i+j) / sampleRate);
+            // Optimization: Iterate slightly fewer than full bit width to avoid edge ISI
+            const safeLength = Math.floor(length * 0.8);
+            const offset = Math.floor((length - safeLength) / 2);
+            const effectiveStart = startIdx + offset;
+
+            for (let i = 0; i < safeLength; i++) {
+                if (effectiveStart + i >= data.length) break;
+                const sample = data[effectiveStart + i];
+                const angle = w * i; 
+                sumI += sample * Math.cos(angle);
+                sumQ += sample * Math.sin(angle);
+            }
+            return Math.sqrt(sumI * sumI + sumQ * sumQ);
+        };
+
+        // 1. Scan for signal (Start Bit = 0 = Space = 1200Hz)
+        let ptr = 0;
+        const window = Math.floor(samplesPerBit);
+        const step = Math.floor(window / 4);
+        let syncFound = false;
+        
+        // Find first strong Space (1200Hz)
+        while (ptr < data.length - window) {
+            const magSpace = getMagnitude(ptr, window, this.spaceFreq);
+            const magMark = getMagnitude(ptr, window, this.markFreq);
+            
+            if (magSpace > 0.05 && magSpace > magMark * 1.5) {
+                syncFound = true;
+                break;
+            }
+            ptr += step;
+        }
+
+        if (!syncFound) return;
+
+        // ptr is now roughly at the start of the first Start Bit.
+        // Center of Start Bit ~= ptr + window/2
+        let samplePtr = ptr + Math.floor(window / 2);
+
+        // 2. Decode Loop
+        while (samplePtr < data.length) {
+            // Read 10 bits: Start, D0..D7, Stop
+            let rawBits = [];
+            
+            for (let b = 0; b < 10; b++) {
+                const bitCenter = samplePtr + Math.floor(b * samplesPerBit);
+                const readStart = bitCenter - Math.floor(window / 2);
+                
+                if (readStart + window >= data.length) break;
+
+                const mSpace = getMagnitude(readStart, window, this.spaceFreq);
+                const mMark = getMagnitude(readStart, window, this.markFreq);
+                
+                rawBits.push(mMark > mSpace ? 1 : 0);
             }
             
-            // Magnitude approx
-            e1200 = Math.abs(e1200);
-            e2200 = Math.abs(e2200);
-            
-            if (e1200 > e2200) bits.push(0);
-            else bits.push(1);
-        }
-        
-        // 2. Parse UART frames from Bit Stream
-        // 0 (Start) + 8 Data + 1 (Stop)
-        
-        let ptr = 0;
-        while (ptr < bits.length - 10) {
-            if (bits[ptr] === 0) { // Potential Start Bit
-                // Check Stop Bit (should be 1)
-                if (bits[ptr + 9] === 1) {
-                    // Valid Frame
-                    let byte = 0;
-                    for (let b = 0; b < 8; b++) {
-                        if (bits[ptr + 1 + b] === 1) {
-                            byte |= (1 << b);
-                        }
-                    }
-                    onByte(byte);
-                    ptr += 10; // Jump to next frame
-                } else {
-                    ptr++; // False start
+            if (rawBits.length < 10) break;
+
+            // Check Framing: Start=0, Stop=1
+            if (rawBits[0] === 0 && rawBits[9] === 1) {
+                let byte = 0;
+                for (let i = 0; i < 8; i++) {
+                    if (rawBits[i+1] === 1) byte |= (1 << i);
                 }
+                onByte(byte);
+                
+                // Advance to next Start Bit (10 bits total)
+                samplePtr += Math.floor(10 * samplesPerBit);
             } else {
-                ptr++; // Idle or stop bit
+                // Framing Error - Drift or Noise
+                // Try to resync by sliding forward to find next Start Bit (Space)
+                let foundNext = false;
+                const searchLimit = samplePtr + Math.floor(2 * samplesPerBit);
+                let searchPtr = samplePtr + step; 
+                
+                while (searchPtr < searchLimit && searchPtr < data.length - window) {
+                     const readStart = searchPtr - Math.floor(window / 2);
+                     const mSpace = getMagnitude(readStart, window, this.spaceFreq);
+                     const mMark = getMagnitude(readStart, window, this.markFreq);
+                     
+                     if (mSpace > mMark * 1.5) {
+                         samplePtr = searchPtr;
+                         foundNext = true;
+                         break;
+                     }
+                     searchPtr += step;
+                }
+                
+                if (!foundNext) {
+                    // Just skip forward 1 bit and hope
+                    samplePtr += Math.floor(samplesPerBit);
+                }
             }
         }
     }
