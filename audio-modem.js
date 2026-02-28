@@ -76,9 +76,19 @@ export class AudioModem {
         fullBuffer.set(dataView, ptr);
 
         // Convert Bytes to Bits (0 and 1)
+        // LEADER: Add 0.5 seconds worth of '1' bits (Idle) to wake up receiver/AGC
+        // At 300 baud, 0.5s = 150 bits. At 3000 baud, 1500 bits.
+        // We'll just add a fixed number of bits (e.g. 500) to be safe for all speeds
+        const LEADER_BITS = 500; 
+        
         // 1 Start bit (0), 8 Data bits (LSB first), 1 Stop bit (1) = 10 bits per byte
-        const bitStream = new Uint8Array(fullBuffer.length * 10);
+        const bitStream = new Uint8Array(LEADER_BITS + fullBuffer.length * 10);
         let bitPtr = 0;
+        
+        // Write Leader (Idle = 1)
+        for(let k=0; k<LEADER_BITS; k++) {
+            bitStream[bitPtr++] = 1;
+        }
         
         for (let i = 0; i < fullBuffer.length; i++) {
             const byte = fullBuffer[i];
@@ -402,12 +412,16 @@ export class AudioModem {
         const step = Math.floor(window / 4);
         let syncFound = false;
         
-        // Find first strong Space (1200Hz)
+        // Find first strong Space (1200Hz) indicating Start Bit
+        // Must be significantly stronger than Mark and Noise
         while (ptr < data.length - window) {
             const magSpace = getMagnitude(ptr, window, this.spaceFreq);
             const magMark = getMagnitude(ptr, window, this.markFreq);
             
-            if (magSpace > 0.05 && magSpace > magMark * 1.5) {
+            // Thresholds:
+            // 1. Space energy must be above noise floor (> 0.05)
+            // 2. Space energy must be dominant (> 2.0x Mark energy to avoid false triggers in noise)
+            if (magSpace > 0.05 && magSpace > magMark * 2.0) {
                 syncFound = true;
                 break;
             }

@@ -283,38 +283,54 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     });
 });
 
-btnUploadAudio.addEventListener('click', () => audioInput.click());
+btnUploadAudio.addEventListener('click', () => {
+    // Reuse context if possible to avoid limit
+    if (!modem.ctx) modem.init();
+    audioInput.click();
+});
 
 audioInput.addEventListener('change', async (e) => {
     if (e.target.files.length === 0) return;
     
     const file = e.target.files[0];
-    rxStatus.textContent = "Processing audio file...";
+    rxStatus.textContent = "Processing audio file (this may take a moment)...";
     
-    const arrayBuffer = await file.arrayBuffer();
-    const ctx = new AudioContext();
-    const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-    
-    resetRx();
-    
-    modem.baud = 300; // Need to know this or detect it. Assuming 300 default.
-    // Try to auto-detect baud? Hard without preamble analysis. 
-    // We'll use the user dropdown value as a hint if we could, but here we hardcode 300 for reliability match.
-    // Actually, let's use the UI value.
-    modem.baud = parseInt(baudSelect.value);
-    
-    modem.decodeOffline(audioBuffer, (byte) => processByte(byte))
-        .then(() => {
-            if (rxMode === 'DONE') {
-                rxStatus.textContent = "Decoding Successful!";
-            } else {
-                console.warn("Decoding finished incomplete. Attempting to render partial data.");
-                rxStatus.textContent = "Decoding Finished (Partial).";
-                if (rxHeader && rxBuffer.length > 0) {
-                    finishDecoding();
+    try {
+        const arrayBuffer = await file.arrayBuffer();
+        
+        // Ensure we have a context
+        if (!modem.ctx) modem.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        if (modem.ctx.state === 'suspended') await modem.ctx.resume();
+        
+        const audioBuffer = await modem.ctx.decodeAudioData(arrayBuffer);
+        
+        resetRx();
+        
+        // Use the selected baud rate from UI
+        modem.baud = parseInt(baudSelect.value) || 300;
+        console.log(`Decoding at ${modem.baud} baud...`);
+        
+        modem.decodeOffline(audioBuffer, (byte) => processByte(byte))
+            .then(() => {
+                if (rxMode === 'DONE') {
+                    rxStatus.textContent = "Decoding Successful!";
+                } else {
+                    console.warn("Decoding finished incomplete.");
+                    rxStatus.textContent = "Decoding Finished (Incomplete).";
+                    // Try to render what we have if we at least got a header
+                    if (rxHeader && rxBuffer.length > 0) {
+                        finishDecoding();
+                    } else if (rxBuffer.length > 0) {
+                        rxStatus.textContent = "Failed: Header not found. Check Baud Rate.";
+                    } else {
+                        rxStatus.textContent = "Failed: No signal detected.";
+                    }
                 }
-            }
-        });
+            });
+    } catch (err) {
+        console.error(err);
+        rxStatus.textContent = "Error loading audio file.";
+    }
 });
 
 btnMic.addEventListener('click', async () => {
@@ -396,7 +412,16 @@ function processByte(byte) {
         if (rxHeader && rxBuffer.length === 5 + rxHeader.mimeLen) {
             // We have the mime string
             const mimeBytes = new Uint8Array(rxBuffer.slice(5));
-            rxHeader.mime = new TextDecoder().decode(mimeBytes);
+            try {
+                const rawMime = new TextDecoder().decode(mimeBytes);
+                // Sanitize MIME
+                rxHeader.mime = rawMime.replace(/[^a-z0-9\/;\-\.]/gi, '');
+                if (rxHeader.mime.length < 3 || !rxHeader.mime.includes('/')) {
+                    rxHeader.mime = 'video/mp4'; // Fallback
+                }
+            } catch(e) {
+                rxHeader.mime = 'video/mp4';
+            }
             
             rxMode = 'DATA';
             rxBuffer = []; // Reset for payload
@@ -427,18 +452,29 @@ function finishDecoding() {
     try {
         const byteArray = new Uint8Array(rxBuffer);
         const mime = (rxHeader && rxHeader.mime) ? rxHeader.mime : 'video/mp4';
+        
+        console.log(`Reconstructing Blob: ${byteArray.length} bytes, type: ${mime}`);
+        
         const blob = new Blob([byteArray], { type: mime });
         
         if (blob.size === 0) throw new Error("Empty Blob");
 
         const url = URL.createObjectURL(blob);
         
+        outputVideo.onerror = () => {
+            rxStatus.textContent = "Video format not supported or corrupted.";
+            console.error("Video load error");
+        };
+        
         outputVideo.src = url;
+        outputVideo.load();
+        
         downloadVideo.href = url;
         
         let ext = 'mp4';
         if (mime.includes('webm')) ext = 'webm';
         else if (mime.includes('quicktime')) ext = 'mov';
+        else if (mime.includes('avi')) ext = 'avi';
         
         downloadVideo.download = `decoded_video.${ext}`;
         

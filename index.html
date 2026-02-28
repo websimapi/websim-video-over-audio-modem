@@ -128,7 +128,7 @@
         class ModemProcessor extends AudioWorkletProcessor {
             constructor() {
                 super();
-                this.sampleRate = 44100; // Will be overwritten by global scope if available, but usually 44.1 or 48k
+                this.sampleRate = 44100; 
                 
                 // TX State
                 this.txBuffer = null;
@@ -140,13 +140,9 @@
                 this.freqHigh = 2200;
                 this.samplesPerSymbol = 0;
 
-                // RX State
-                this.rxActive = false;
-                this.bufferSize = 1024;
-                
                 this.port.onmessage = (e) => {
                     if (e.data.type === 'TX_START') {
-                        this.txBuffer = e.data.buffer; // Uint8Array of bits (0 or 1)
+                        this.txBuffer = e.data.buffer; 
                         this.baud = e.data.baud;
                         this.sampleRate = e.data.sampleRate;
                         this.samplesPerSymbol = this.sampleRate / this.baud;
@@ -180,12 +176,10 @@
                         const freq = bit === 1 ? this.freqHigh : this.freqLow;
 
                         // Generate Sine Wave
-                        // phase increment = 2 * PI * freq / sampleRate
                         const phaseIncrement = (2 * Math.PI * freq) / this.sampleRate;
                         this.phase += phaseIncrement;
                         if (this.phase > 2 * Math.PI) this.phase -= 2 * Math.PI;
 
-                        // Soften edges slightly to reduce clicking (simple slew limiting could go here, but pure sine is usually fine for FSK)
                         channel[i] = Math.sin(this.phase);
 
                         // Advance symbol pointer
@@ -199,15 +193,8 @@
                             progress: this.txIndex / this.txBuffer.length 
                         });
                     }
-                } else {
-                    // Silence
-                    // for (let i = 0; i < channel.length; i++) channel[i] = 0; 
-                    // (Buffers are zeroed by default)
                 }
 
-                // Pass through input for analysis visualization in main thread
-                // We don't decode here because FFT is heavy and complex to implement raw in AudioWorklet 
-                // without WASM. We'll send time domain data to main thread AnalyserNode for RX.
                 return true;
             }
         }
