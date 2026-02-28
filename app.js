@@ -12,6 +12,10 @@ const btnDownloadAudio = document.getElementById('btn-download-audio');
 const txProgress = document.getElementById('tx-progress');
 const txStatus = document.getElementById('tx-status');
 const baudSelect = document.getElementById('baud-rate');
+const qualitySelect = document.getElementById('quality-select');
+const compressionPanel = document.getElementById('compression-panel');
+const compressionProgress = document.getElementById('compression-progress');
+const compressionStatusText = document.getElementById('compression-status-text');
 
 const btnMic = document.getElementById('btn-mic');
 const btnUploadAudio = document.getElementById('btn-upload-audio');
@@ -59,8 +63,10 @@ function handleFile(file) {
     
     // Warning for large files
     if (file.size > 1000000) { // 1MB
-        txStatus.textContent = "Warning: Large file. Transmission will take a long time.";
+        txStatus.textContent = "File > 1MB. Compression recommended.";
         txStatus.style.color = "orange";
+        // Auto-select medium quality if large to encourage usage
+        if(qualitySelect.value === 'original') qualitySelect.value = "medium";
     } else {
         txStatus.textContent = "Ready to encode.";
         txStatus.style.color = "#aaa";
@@ -71,11 +77,24 @@ btnPlay.addEventListener('click', async () => {
     if (!selectedFile) return;
     
     btnPlay.disabled = true;
+
+    let fileToTransmit = selectedFile;
+    
+    // Check compression
+    if (qualitySelect.value !== 'original') {
+        try {
+            fileToTransmit = await performCompression(selectedFile, qualitySelect.value);
+        } catch (e) {
+            console.error(e);
+            txStatus.textContent = "Compression failed, using original.";
+        }
+    }
+    
     txStatus.textContent = "Generating audio stream...";
     
     const baud = parseInt(baudSelect.value);
     
-    await modem.transmit(selectedFile, baud, (progress) => {
+    await modem.transmit(fileToTransmit, baud, (progress) => {
         txProgress.style.width = `${progress * 100}%`;
         txStatus.textContent = `Transmitting: ${Math.floor(progress * 100)}%`;
     }, () => {
@@ -87,22 +106,149 @@ btnPlay.addEventListener('click', async () => {
 
 btnDownloadAudio.addEventListener('click', async () => {
     if (!selectedFile) return;
+
+    let fileToTransmit = selectedFile;
+    
+    // Check compression
+    if (qualitySelect.value !== 'original') {
+        try {
+            fileToTransmit = await performCompression(selectedFile, qualitySelect.value);
+        } catch (e) {
+            console.error(e);
+            txStatus.textContent = "Compression failed, using original.";
+        }
+    }
     
     txStatus.textContent = "Rendering audio file (this may freeze briefly)...";
     const baud = parseInt(baudSelect.value);
     
     setTimeout(async () => {
-        const blob = await modem.generateDownloadLink(selectedFile, baud);
+        const blob = await modem.generateDownloadLink(fileToTransmit, baud);
         if (blob) {
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `${selectedFile.name}.wav`;
+            a.download = `${selectedFile.name.split('.')[0]}_audio.wav`;
             a.click();
             txStatus.textContent = "Audio saved.";
         }
     }, 100);
 });
+
+// --- COMPRESSION LOGIC ---
+
+async function performCompression(file, quality) {
+    return new Promise(async (resolve, reject) => {
+        compressionPanel.classList.remove('hidden');
+        compressionStatusText.textContent = "Preparing video compressor...";
+        compressionProgress.style.width = '0%';
+        
+        const video = document.createElement('video');
+        video.muted = true;
+        video.playsInline = true;
+        
+        await new Promise(r => {
+            video.onloadedmetadata = r;
+            video.src = URL.createObjectURL(file);
+        });
+        
+        let targetWidth, targetFps, targetBitrate;
+        
+        switch(quality) {
+            case 'medium': // 240p
+                targetWidth = 240;
+                targetFps = 15;
+                targetBitrate = 150000; // 150kbps
+                break;
+            case 'low': // 144p
+                targetWidth = 144;
+                targetFps = 10;
+                targetBitrate = 50000; // 50kbps
+                break;
+            case 'lowest': // 64p
+                targetWidth = 64;
+                targetFps = 5;
+                targetBitrate = 15000; // 15kbps
+                break;
+            default:
+                targetWidth = 320;
+                targetFps = 20;
+                targetBitrate = 250000;
+        }
+        
+        // Calculate Height keeping aspect ratio
+        const aspect = video.videoWidth / video.videoHeight;
+        const targetHeight = Math.round(targetWidth / aspect);
+        
+        const canvas = document.createElement('canvas');
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+        const ctx = canvas.getContext('2d');
+        
+        // Audio handling
+        let combinedStream;
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        
+        try {
+            const source = audioCtx.createMediaElementSource(video);
+            const dest = audioCtx.createMediaStreamDestination();
+            source.connect(dest);
+            const videoStream = canvas.captureStream(targetFps);
+            combinedStream = new MediaStream([...videoStream.getVideoTracks(), ...dest.stream.getAudioTracks()]);
+        } catch (e) {
+            console.warn("Audio compression setup failed, silent video only.", e);
+            combinedStream = canvas.captureStream(targetFps);
+        }
+
+        let mimeType = 'video/webm;codecs=vp8,opus';
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+             mimeType = 'video/webm'; 
+        }
+        
+        const recorder = new MediaRecorder(combinedStream, {
+            mimeType: mimeType,
+            videoBitsPerSecond: targetBitrate
+        });
+        
+        const chunks = [];
+        recorder.ondataavailable = e => chunks.push(e.data);
+        recorder.onstop = () => {
+            const blob = new Blob(chunks, { type: 'video/webm' });
+            compressionPanel.classList.add('hidden');
+            
+            // Log savings
+            const savings = Math.round((1 - (blob.size / file.size)) * 100);
+            txStatus.textContent = `Compressed: ${(blob.size/1024).toFixed(1)}KB (${savings}% smaller)`;
+            
+            // Clean up
+            video.remove();
+            canvas.remove();
+            audioCtx.close();
+            resolve(blob);
+        };
+        
+        recorder.start();
+        video.play();
+        
+        compressionStatusText.textContent = `Compressing to ${targetWidth}x${targetHeight} @ ${targetFps}fps...`;
+        
+        // Drawing Loop
+        const draw = () => {
+            if (video.paused || video.ended) return;
+            ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+            
+            // Update Progress
+            const pct = (video.currentTime / video.duration) * 100;
+            compressionProgress.style.width = `${pct}%`;
+            
+            requestAnimationFrame(draw);
+        };
+        
+        video.onplay = () => draw();
+        video.onended = () => recorder.stop();
+        video.onerror = (e) => reject(e);
+    });
+}
 
 // --- DECODER EVENTS ---
 

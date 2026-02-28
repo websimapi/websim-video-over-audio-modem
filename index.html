@@ -39,6 +39,15 @@
                     
                     <div class="settings">
                         <label>
+                            Quality (Pre-process):
+                            <select id="quality-select">
+                                <option value="original">Original (Raw)</option>
+                                <option value="medium" selected>Medium (240p, 15fps)</option>
+                                <option value="low">Low (120p, 10fps)</option>
+                                <option value="lowest">Tiny (64p, 5fps)</option>
+                            </select>
+                        </label>
+                        <label>
                             Speed (Baud):
                             <select id="baud-rate">
                                 <option value="100">100 (Robust/Air)</option>
@@ -46,6 +55,13 @@
                                 <option value="1000">1000 (Fast/Cable)</option>
                             </select>
                         </label>
+                    </div>
+                    
+                    <div id="compression-panel" class="status-display hidden" style="margin-bottom: 1rem; border: 1px solid var(--accent);">
+                        <span id="compression-status-text">Optimizing video...</span>
+                        <div class="progress-bar">
+                            <div class="fill" id="compression-progress"></div>
+                        </div>
                     </div>
 
                     <div class="actions">
