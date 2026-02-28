@@ -98,16 +98,17 @@ export class AudioModem {
         return bitStream;
     }
 
+    stop() {
+        if (this.node) {
+            this.node.port.postMessage({ type: 'TX_STOP' });
+        }
+    }
+
     async transmit(file, baudRate, onProgress, onComplete) {
         await this.init();
         this.baud = baudRate;
         
         const bitStream = await this.prepareFile(file);
-        
-        // Prepare recorder if we want to download the audio
-        // But for 'Play', we just connect to destination.
-        // If we want 'Save Audio', we intercept.
-        // Currently 'transmit' assumes playback.
         
         this.node.port.postMessage({
             type: 'TX_START',
@@ -125,44 +126,92 @@ export class AudioModem {
         };
     }
     
-    async generateDownloadLink(file, baudRate) {
-        await this.init();
-        
-        // Create offline context to render fast
-        // Duration = bits / baud
+    async generateDownloadLink(file, baudRate, onProgress) {
+        const sampleRate = 44100;
         const bitStream = await this.prepareFile(file);
-        const duration = bitStream.length / baudRate;
+        const samplesPerSymbol = sampleRate / baudRate;
+        const totalSamples = Math.floor(bitStream.length * samplesPerSymbol);
         
-        // Limit offline rendering size (Browser crash risk)
-        // If > 2 minutes, warn user or do real-time record
-        if (duration > 120) {
-            alert("Video is too long to generate a file instantly. Use 'Play' and record system audio, or pick a smaller file.");
-            return null;
-        }
+        // WAV Header
+        const header = new ArrayBuffer(44);
+        const view = new DataView(header);
+        
+        const formatChunkSize = 16;
+        const numChannels = 1;
+        const bitsPerSample = 16;
+        const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+        const blockAlign = numChannels * (bitsPerSample / 8);
+        const dataChunkSize = totalSamples * blockAlign;
+        const fileSize = 36 + dataChunkSize;
 
-        const offlineCtx = new OfflineAudioContext(1, duration * 44100, 44100);
+        // RIFF
+        view.setUint32(0, 0x52494646, false); // "RIFF"
+        view.setUint32(4, fileSize, true);
+        view.setUint32(8, 0x57415645, false); // "WAVE"
         
-        // Re-implement simplified oscillator logic for offline render (AudioWorklet in OfflineCtx is tricky cross-browser)
-        const buffer = offlineCtx.createBuffer(1, duration * 44100, 44100);
-        const data = buffer.getChannelData(0);
-        const samplesPerSymbol = 44100 / baudRate;
+        // fmt
+        view.setUint32(12, 0x666d7420, false); // "fmt "
+        view.setUint32(16, formatChunkSize, true);
+        view.setUint16(20, 1, true); // PCM
+        view.setUint16(22, numChannels, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, byteRate, true);
+        view.setUint16(32, blockAlign, true);
+        view.setUint16(34, bitsPerSample, true);
+        
+        // data
+        view.setUint32(36, 0x64617461, false); // "data"
+        view.setUint32(40, dataChunkSize, true);
+
+        const chunks = [header];
+        
+        // Generate Audio Data in Chunks to prevent blocking/crashing
         let phase = 0;
-        let dataIdx = 0;
+        // Adjust batch size based on baud rate to keep UI responsive
+        const batchSize = Math.max(1000, Math.floor(baudRate * 0.5)); 
         
-        for (let i = 0; i < bitStream.length; i++) {
-            const bit = bitStream[i];
-            const freq = bit === 1 ? this.markFreq : this.spaceFreq;
-            const len = Math.floor((i + 1) * samplesPerSymbol) - Math.floor(i * samplesPerSymbol);
+        for (let i = 0; i < bitStream.length; i += batchSize) {
+            const end = Math.min(i + batchSize, bitStream.length);
             
-            for (let s = 0; s < len; s++) {
-                data[dataIdx] = Math.sin(phase);
-                phase += (2 * Math.PI * freq) / 44100;
-                dataIdx++;
+            // Calculate sample range for this batch
+            const startSample = Math.floor(i * samplesPerSymbol);
+            const endSample = Math.floor(end * samplesPerSymbol);
+            const batchSampleCount = endSample - startSample;
+            
+            const buffer = new Int16Array(batchSampleCount);
+            let bufIdx = 0;
+            
+            for (let b = i; b < end; b++) {
+                const bit = bitStream[b];
+                const freq = bit === 1 ? this.markFreq : this.spaceFreq;
+                
+                const bitStartSample = Math.floor(b * samplesPerSymbol);
+                const bitEndSample = Math.floor((b + 1) * samplesPerSymbol);
+                const len = bitEndSample - bitStartSample;
+                
+                const phaseInc = (2 * Math.PI * freq) / sampleRate;
+                
+                for (let s = 0; s < len; s++) {
+                    const val = Math.sin(phase);
+                    phase += phaseInc;
+                    if (phase > 2 * Math.PI) phase -= 2 * Math.PI;
+                    
+                    // Scale to 16-bit
+                    buffer[bufIdx++] = val < 0 ? val * 0x8000 : val * 0x7FFF;
+                }
+            }
+            
+            chunks.push(buffer);
+            
+            // Update UI and Yield
+            if (onProgress) {
+                onProgress(end / bitStream.length);
+                // Yield to main thread every batch to keep UI responsive
+                await new Promise(r => setTimeout(r, 0));
             }
         }
         
-        // To Wav
-        return this.bufferToWave(buffer, duration * 44100);
+        return new Blob(chunks, { type: 'audio/wav' });
     }
 
     // RX SETUP

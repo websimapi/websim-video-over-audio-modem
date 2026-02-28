@@ -76,6 +76,45 @@ function handleFile(file) {
 btnPlay.addEventListener('click', async () => {
     if (!selectedFile) return;
     
+    // Stop any existing actions
+    modem.stop();
+    
+    btnPlay.disabled = true;
+    btnDownloadAudio.disabled = true;
+
+    let fileToTransmit = selectedFile;
+    
+    // Check compression
+    if (qualitySelect.value !== 'original') {
+        try {
+            fileToTransmit = await performCompression(selectedFile, qualitySelect.value);
+        } catch (e) {
+            console.error(e);
+            txStatus.textContent = "Compression failed, using original.";
+        }
+    }
+    
+    txStatus.textContent = "Broadcasting Audio...";
+    
+    const baud = parseInt(baudSelect.value);
+    
+    await modem.transmit(fileToTransmit, baud, (progress) => {
+        txProgress.style.width = `${progress * 100}%`;
+        txStatus.textContent = `Broadcasting: ${Math.floor(progress * 100)}%`;
+    }, () => {
+        txStatus.textContent = "Broadcast Complete.";
+        btnPlay.disabled = false;
+        btnDownloadAudio.disabled = false;
+        txProgress.style.width = '100%';
+    });
+});
+
+btnDownloadAudio.addEventListener('click', async () => {
+    if (!selectedFile) return;
+    
+    modem.stop(); // Stop playback if any
+    
+    btnDownloadAudio.disabled = true;
     btnPlay.disabled = true;
 
     let fileToTransmit = selectedFile;
@@ -90,40 +129,15 @@ btnPlay.addEventListener('click', async () => {
         }
     }
     
-    txStatus.textContent = "Generating audio stream...";
-    
+    txStatus.textContent = "Generating audio file...";
     const baud = parseInt(baudSelect.value);
     
-    await modem.transmit(fileToTransmit, baud, (progress) => {
-        txProgress.style.width = `${progress * 100}%`;
-        txStatus.textContent = `Transmitting: ${Math.floor(progress * 100)}%`;
-    }, () => {
-        txStatus.textContent = "Transmission Complete.";
-        btnPlay.disabled = false;
-        txProgress.style.width = '100%';
-    });
-});
-
-btnDownloadAudio.addEventListener('click', async () => {
-    if (!selectedFile) return;
-
-    let fileToTransmit = selectedFile;
-    
-    // Check compression
-    if (qualitySelect.value !== 'original') {
-        try {
-            fileToTransmit = await performCompression(selectedFile, qualitySelect.value);
-        } catch (e) {
-            console.error(e);
-            txStatus.textContent = "Compression failed, using original.";
-        }
-    }
-    
-    txStatus.textContent = "Rendering audio file (this may freeze briefly)...";
-    const baud = parseInt(baudSelect.value);
-    
-    setTimeout(async () => {
-        const blob = await modem.generateDownloadLink(fileToTransmit, baud);
+    try {
+        const blob = await modem.generateDownloadLink(fileToTransmit, baud, (progress) => {
+            txProgress.style.width = `${progress * 100}%`;
+            txStatus.textContent = `Generating WAV: ${Math.floor(progress * 100)}%`;
+        });
+        
         if (blob) {
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -132,7 +146,13 @@ btnDownloadAudio.addEventListener('click', async () => {
             a.click();
             txStatus.textContent = "Audio saved.";
         }
-    }, 100);
+    } catch (e) {
+        console.error(e);
+        txStatus.textContent = "Error generating file.";
+    }
+    
+    btnDownloadAudio.disabled = false;
+    btnPlay.disabled = false;
 });
 
 // --- COMPRESSION LOGIC ---
