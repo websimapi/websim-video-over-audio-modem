@@ -435,8 +435,6 @@ export class AudioModem {
         const step = Math.max(1, Math.floor(window / 8)); // Finer step for sync
         
         // 1. Initial Scan for Carrier/Leader
-        // We look for a sequence of '1's (Mark) which is the idle state, 
-        // followed by a '0' (Space) which is the Start Bit.
         let ptr = 0;
         let syncFound = false;
         
@@ -451,13 +449,15 @@ export class AudioModem {
                 break;
             }
             ptr += step;
+            
+            // Yield occasionally to keep UI responsive during scan
+            if (ptr % 50000 < step) await new Promise(r => setTimeout(r, 0));
         }
 
         if (!syncFound) return; // No signal found
 
         // We found a start bit candidate at 'ptr'.
         // Refine 'ptr' to find the edge (transition from Mark to Space)
-        // Backtrack slightly and find where Space energy crosses Mark energy
         let refinedPtr = Math.max(0, ptr - window);
         const refineEnd = ptr + window;
         while(refinedPtr < refineEnd) {
@@ -475,13 +475,13 @@ export class AudioModem {
 
         // 2. Decode Loop
         let consecutiveErrors = 0;
+        let bytesDecoded = 0;
         
         while (samplePtr < data.length) {
             // We expect 10 bits: Start(0), D0..D7, Stop(1)
             
             // Read all 10 bits
             const bits = [];
-            const bitMagnitudes = [];
             
             for(let i=0; i<10; i++) {
                 const center = samplePtr + Math.floor(i * samplesPerBit);
@@ -492,7 +492,6 @@ export class AudioModem {
                 const mMark = getMagnitude(start, window, decodeMark);
                 
                 bits.push(mMark > mSpace ? 1 : 0);
-                bitMagnitudes.push({space: mSpace, mark: mMark});
             }
             
             // Validate Framing
@@ -504,51 +503,46 @@ export class AudioModem {
                     if (bits[i+1] === 1) byte |= (1 << i);
                 }
                 onByte(byte);
+                bytesDecoded++;
                 consecutiveErrors = 0;
                 
                 // Hard Sync Adjustment
-                // Recalculate center based on Stop bit edge if possible, 
-                // but for now, just advance by exactly 10 bits.
                 samplePtr += Math.floor(10 * samplesPerBit);
                 
             } else {
                 // Framing Error
                 consecutiveErrors++;
                 if (consecutiveErrors > 50) {
-                     // Lost sync completely, scan for next start bit
-                     samplePtr += Math.floor(samplesPerBit); // Nudge forward
-                     // We fall through to the resync logic below
+                     // Lost sync completely
+                     samplePtr += Math.floor(samplesPerBit); 
                 }
                 
-                // Resync Logic: Look for the next Start Bit (Space)
-                // We expected a Start bit at samplePtr, but didn't get 0, or didn't get Stop 1.
-                // Let's scan forward bit by bit to find a 0 followed by valid data
+                // Resync Logic
                 let reSyncFound = false;
-                // Scan range: next 20 bits
                 const scanLimit = samplePtr + Math.floor(20 * samplesPerBit);
-                let scanPtr = samplePtr + Math.floor(samplesPerBit * 0.5); // Move past current bad position
+                let scanPtr = samplePtr + Math.floor(samplesPerBit * 0.5); 
                 
                 while(scanPtr < scanLimit && scanPtr < data.length - window) {
                      const start = scanPtr - Math.floor(window/2);
                      const mSpace = getMagnitude(start, window, decodeSpace);
                      const mMark = getMagnitude(start, window, decodeMark);
                      
-                     // Found a potential Start Bit
                      if (mSpace > mMark * 1.2) {
-                         // Check if Stop bit exists 9 bits later?
-                         // Ideally yes, but computationally expensive. 
-                         // Just assume this is the new start.
                          samplePtr = scanPtr;
                          reSyncFound = true;
                          break;
                      }
-                     scanPtr += Math.floor(samplesPerBit / 4); // Quarter bit steps
+                     scanPtr += Math.floor(samplesPerBit / 4);
                 }
                 
                 if (!reSyncFound) {
-                    // No start bit found nearby, just skip this frame length
                     samplePtr += Math.floor(10 * samplesPerBit);
                 }
+            }
+
+            // Yield to main thread every ~50 bytes to allow UI updates and prevent freezing
+            if (bytesDecoded % 50 === 0) {
+                await new Promise(r => setTimeout(r, 0));
             }
         }
     }

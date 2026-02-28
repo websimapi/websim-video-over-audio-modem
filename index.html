@@ -198,6 +198,11 @@
                             progress: this.txIndex / this.txBuffer.length 
                         });
                     }
+                } else {
+                    // Fill with silence if inactive
+                    for (let i = 0; i < channel.length; i++) {
+                        channel[i] = 0;
+                    }
                 }
 
                 return true;

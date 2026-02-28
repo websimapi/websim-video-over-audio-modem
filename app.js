@@ -27,9 +27,12 @@ const resultArea = document.getElementById('result-area');
 
 // State
 let selectedFile = null;
-let rxBuffer = []; // Bytes received
+let rxBuffer = null; // Uint8Array for payload in DATA mode
+let rxHeaderBuffer = []; // Array for header accumulation
+let rxPtr = 0; // Pointer for Uint8Array
 let rxHeader = null; // { size, mime }
 let rxMode = 'IDLE';
+let currentVideoUrl = null;
 
 // --- ENCODER EVENTS ---
 
@@ -317,12 +320,11 @@ audioInput.addEventListener('change', async (e) => {
                 } else {
                     console.warn("Decoding finished incomplete.");
                     // Try to render what we have if we at least got a header
-                    if (rxHeader && rxBuffer.length > 0) {
-                         rxStatus.textContent = "Stream ended. Attempting partial render...";
+                    if (rxHeader && rxPtr > 0) {
+                        rxStatus.textContent = "Stream ended early. Attempting partial render...";
                         finishDecoding();
-                    } else if (rxBuffer.length > 0) {
-                        rxStatus.textContent = "Failed: Header not found or signal too noisy.";
-                        console.log("Buffered bytes:", rxBuffer.slice(0, 20).map(b=>b.toString(16)));
+                    } else if (rxHeaderBuffer.length > 0 || rxPtr > 0) {
+                        rxStatus.textContent = "Failed: Signal too noisy or header incomplete.";
                     } else {
                         rxStatus.textContent = "Failed: No signal detected. Check Baud Rate.";
                     }
@@ -359,60 +361,65 @@ btnMic.addEventListener('click', async () => {
 // --- RX LOGIC ---
 
 function resetRx() {
-    rxBuffer = [];
+    rxBuffer = null;
+    rxHeaderBuffer = [];
+    rxPtr = 0;
     rxHeader = null;
     rxMode = 'SEARCHING';
     rxStatus.textContent = "Searching for signal...";
     document.getElementById('rx-bytes').textContent = "0 bytes";
     resultArea.classList.add('hidden');
     
-    // Clear video
-    outputVideo.src = "";
+    // Clean up previous video blob
+    if (currentVideoUrl) {
+        URL.revokeObjectURL(currentVideoUrl);
+        currentVideoUrl = null;
+    }
+    outputVideo.removeAttribute('src');
+    outputVideo.load();
 }
 
 function processByte(byte) {
-    // console.log("Byte:", byte.toString(16));
-    
     if (rxMode === 'SEARCHING') {
-        rxBuffer.push(byte);
+        rxHeaderBuffer.push(byte);
         // Look for Sync 0xAA 0x55
-        if (rxBuffer.length >= 2) {
-            const last = rxBuffer[rxBuffer.length-1];
-            const prev = rxBuffer[rxBuffer.length-2];
+        if (rxHeaderBuffer.length >= 2) {
+            const last = rxHeaderBuffer[rxHeaderBuffer.length-1];
+            const prev = rxHeaderBuffer[rxHeaderBuffer.length-2];
             
             if (prev === 0xAA && last === 0x55) {
                 rxMode = 'HEADER';
-                rxBuffer = []; // Clear sync bytes
+                rxHeaderBuffer = []; // Clear sync bytes, start fresh for header
                 rxStatus.textContent = "Sync detected! Reading Header...";
-            } else if (rxBuffer.length > 10) {
-                rxBuffer.shift(); // Keep buffer small
+            } else if (rxHeaderBuffer.length > 10) {
+                rxHeaderBuffer.shift(); // Keep buffer small
             }
         }
     } else if (rxMode === 'HEADER') {
-        rxBuffer.push(byte);
+        rxHeaderBuffer.push(byte);
         
         // Header Structure: Size (4) + MimeLen (1)
-        if (rxBuffer.length === 5) {
+        if (rxHeaderBuffer.length === 5) {
             // We have size and mime len
-            const sizeBytes = new Uint8Array(rxBuffer.slice(0, 4));
+            const sizeBytes = new Uint8Array(rxHeaderBuffer.slice(0, 4));
             // Uint32 from bytes (little endian)
             const size = new Uint32Array(sizeBytes.buffer)[0];
-            const mimeLen = rxBuffer[4];
+            const mimeLen = rxHeaderBuffer[4];
             
             // Sanity Check for invalid headers (noise)
             if (size > 100000000 || mimeLen > 100 || size === 0) { 
                 console.warn(`Invalid Header detected: Size=${size}`);
                 rxMode = 'SEARCHING';
-                rxBuffer = [];
+                rxHeaderBuffer = [];
                 return;
             }
 
             rxHeader = { size, mimeLen, mime: '' };
         } 
         
-        if (rxHeader && rxBuffer.length === 5 + rxHeader.mimeLen) {
+        if (rxHeader && rxHeaderBuffer.length === 5 + rxHeader.mimeLen) {
             // We have the mime string
-            const mimeBytes = new Uint8Array(rxBuffer.slice(5));
+            const mimeBytes = new Uint8Array(rxHeaderBuffer.slice(5));
             try {
                 const rawMime = new TextDecoder().decode(mimeBytes);
                 // Sanitize MIME
@@ -425,17 +432,25 @@ function processByte(byte) {
             }
             
             rxMode = 'DATA';
-            rxBuffer = []; // Reset for payload
+            // Allocate Uint8Array for high performance
+            rxBuffer = new Uint8Array(rxHeader.size);
+            rxPtr = 0;
             rxStatus.textContent = `Receiving ${rxHeader.mime} (${rxHeader.size} bytes)...`;
         }
     } else if (rxMode === 'DATA') {
-        rxBuffer.push(byte);
+        // Safety check
+        if (rxPtr < rxBuffer.length) {
+            rxBuffer[rxPtr++] = byte;
+        }
         
-        const pct = Math.floor((rxBuffer.length / rxHeader.size) * 100);
-        document.getElementById('rx-progress').style.width = `${pct}%`;
-        document.getElementById('rx-bytes').textContent = `${rxBuffer.length} / ${rxHeader.size}`;
+        // Throttled UI Updates (every 256 bytes) to prevent lag
+        if (rxPtr % 256 === 0 || rxPtr === rxBuffer.length) {
+            const pct = Math.floor((rxPtr / rxHeader.size) * 100);
+            document.getElementById('rx-progress').style.width = `${pct}%`;
+            document.getElementById('rx-bytes').textContent = `${rxPtr} / ${rxHeader.size}`;
+        }
         
-        if (rxBuffer.length >= rxHeader.size) {
+        if (rxPtr >= rxHeader.size) {
             rxMode = 'DONE';
             finishDecoding();
         }
@@ -445,30 +460,42 @@ function processByte(byte) {
 function finishDecoding() {
     rxStatus.textContent = "Reconstructing Video...";
     
-    if (rxBuffer.length === 0) {
+    if (!rxBuffer || rxPtr === 0) {
         rxStatus.textContent = "Error: No data decoded.";
         return;
     }
 
     try {
-        const byteArray = new Uint8Array(rxBuffer);
+        // rxBuffer is already a Uint8Array. 
+        // If it was only partially filled (eof unexpected), slice it.
+        let finalBuffer = rxBuffer;
+        if (rxPtr < rxBuffer.length) {
+            finalBuffer = rxBuffer.slice(0, rxPtr);
+            console.warn(`Truncated data: Expected ${rxBuffer.length}, got ${rxPtr}`);
+        }
+
         const mime = (rxHeader && rxHeader.mime) ? rxHeader.mime : 'video/mp4';
+        console.log(`Reconstructing Blob: ${finalBuffer.length} bytes, type: ${mime}`);
         
-        console.log(`Reconstructing Blob: ${byteArray.length} bytes, type: ${mime}`);
-        
-        const blob = new Blob([byteArray], { type: mime });
+        const blob = new Blob([finalBuffer], { type: mime });
         
         if (blob.size === 0) throw new Error("Empty Blob");
 
         const url = URL.createObjectURL(blob);
+        currentVideoUrl = url;
         
-        // Reset video element to clear previous errors
+        // Reset video element to clear previous errors/state
         outputVideo.removeAttribute('src');
         outputVideo.load();
 
+        outputVideo.oncanplay = () => {
+             // Play automatically if possible, helps check validity
+             outputVideo.play().catch(e => console.log("Auto-play prevented"));
+        };
+
         outputVideo.onerror = (e) => {
-            rxStatus.textContent = "Video corrupted or format unsupported.";
-            console.error("Video load error", e);
+            console.error("Video load error", outputVideo.error);
+            rxStatus.textContent = `Video format error. Please try downloading the file.`;
         };
         
         outputVideo.src = url;
@@ -483,7 +510,7 @@ function finishDecoding() {
         downloadVideo.download = `decoded_video.${ext}`;
         
         resultArea.classList.remove('hidden');
-        rxStatus.textContent = "Complete!";
+        rxStatus.textContent = "Decoding Complete!";
     } catch (e) {
         console.error("Reconstruction failed:", e);
         rxStatus.textContent = "Error reconstructing video file.";
